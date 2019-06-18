@@ -15,14 +15,10 @@ namespace Minishlink\WebPush;
 
 use Base64Url\Base64Url;
 use GuzzleHttp\Client;
-use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Psr7\Request;
-use Psr\Http\Message\ResponseInterface;
 
 class WebPush
 {
     public const GCM_URL = 'https://android.googleapis.com/gcm/send';
-    public const FCM_BASE_URL = 'https://fcm.googleapis.com';
 
     /**
      * @var Client
@@ -150,7 +146,6 @@ class WebPush
     public function flush(?int $batchSize = null): \Generator
     {
         if (null === $this->notifications || empty($this->notifications)) {
-            yield from [];
             return;
         }
 
@@ -164,25 +159,16 @@ class WebPush
         $this->notifications = [];
 
         foreach ($batches as $batch) {
-            // for each endpoint server type
             $requests = $this->prepare($batch);
 
-            $promises = [];
-
             foreach ($requests as $request) {
-                $promises[] = $this->client->sendAsync($request)
-                    ->then(function ($response) use ($request) {
-                        /** @var ResponseInterface $response * */
-                        return new MessageSentReport($request, $response);
-                    })
-                    ->otherwise(function ($reason) {
-                        /** @var RequestException $reason **/
-                        return new MessageSentReport($reason->getRequest(), $reason->getResponse(), false, $reason->getMessage());
-                    });
-            }
-
-            foreach ($promises as $promise) {
-                yield $promise->wait();
+                $this->client->post(
+                    $request->getEndpoint(),
+                    [
+                        'headers' => $request->getHeaders(),
+                        'body' => $request->getContent(),
+                    ]
+                );
             }
         }
 
@@ -282,7 +268,7 @@ class WebPush
                 }
             }
 
-            $requests[] = new Request('POST', $endpoint, $headers, $content);
+            $requests[] = new Request($endpoint, $headers, $content);
         }
 
         return $requests;
