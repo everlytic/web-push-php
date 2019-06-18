@@ -106,8 +106,7 @@ class WebPush
      * @param array $options Array with several options tied to this notification. If not set, will use the default options that you can set in the WebPush object
      * @param array $auth Use this auth details instead of what you provided when creating WebPush
      *
-     * @return \Generator|MessageSentReport[]|true Return an array of information if $flush is set to true and the queued requests has failed.
-     *                    Else return true
+     * @return \GuzzleHttp\Message\FutureResponse|\GuzzleHttp\Message\ResponseInterface|\GuzzleHttp\Ring\Future\FutureInterface|null
      *
      * @throws \ErrorException
      */
@@ -130,148 +129,104 @@ class WebPush
             $auth['VAPID'] = VAPID::validate($auth['VAPID']);
         }
 
-        $this->notifications[] = new Notification($subscription, $payload, $options, $auth);
-
-        return false !== $flush ? $this->flush() : true;
+        $request = $this->prepare(new Notification($subscription, $payload, $options, $auth));
+        return $this->client->post(
+            $request->getEndpoint(),
+            [
+                'headers' => $request->getHeaders(),
+                'body' => $request->getContent(),
+            ]
+        );
     }
 
     /**
-     * Flush notifications. Triggers the requests.
+     * @param Notification $notification
+     * @return Request
      *
-     * @param null|int $batchSize Defaults the value defined in defaultOptions during instantiation (which defaults to 1000).
-     *
-     * @return \Generator|MessageSentReport[]
      * @throws \ErrorException
      */
-    public function flush(?int $batchSize = null): \Generator
+    private function prepare(Notification $notification): Request
     {
-        if (null === $this->notifications || empty($this->notifications)) {
-            return;
-        }
+        $subscription = $notification->getSubscription();
+        $endpoint = $subscription->getEndpoint();
+        $userPublicKey = $subscription->getPublicKey();
+        $userAuthToken = $subscription->getAuthToken();
+        $contentEncoding = $subscription->getContentEncoding();
+        $payload = $notification->getPayload();
+        $options = $notification->getOptions($this->getDefaultOptions());
+        $auth = $notification->getAuth($this->auth);
 
-        if (null === $batchSize) {
-            $batchSize = $this->defaultOptions['batchSize'];
-        }
-
-        $batches = array_chunk($this->notifications, $batchSize);
-
-        // reset queue
-        $this->notifications = [];
-
-        foreach ($batches as $batch) {
-            $requests = $this->prepare($batch);
-
-            foreach ($requests as $request) {
-                $this->client->post(
-                    $request->getEndpoint(),
-                    [
-                        'headers' => $request->getHeaders(),
-                        'body' => $request->getContent(),
-                    ]
-                );
+        if (!empty($payload) && !empty($userPublicKey) && !empty($userAuthToken)) {
+            if (!$contentEncoding) {
+                throw new \ErrorException('Subscription should have a content encoding');
             }
+
+            $encrypted = Encryption::encrypt($payload, $userPublicKey, $userAuthToken, $contentEncoding);
+            $cipherText = $encrypted['cipherText'];
+            $salt = $encrypted['salt'];
+            $localPublicKey = $encrypted['localPublicKey'];
+
+            $headers = [
+                'Content-Type' => 'application/octet-stream',
+                'Content-Encoding' => $contentEncoding,
+            ];
+
+            if ($contentEncoding === "aesgcm") {
+                $headers['Encryption'] = 'salt='.Base64Url::encode($salt);
+                $headers['Crypto-Key'] = 'dh='.Base64Url::encode($localPublicKey);
+            }
+
+            $encryptionContentCodingHeader = Encryption::getContentCodingHeader($salt, $localPublicKey, $contentEncoding);
+            $content = $encryptionContentCodingHeader.$cipherText;
+
+            $headers['Content-Length'] = Utils::safeStrlen($content);
+        } else {
+            $headers = [
+                'Content-Length' => 0,
+            ];
+
+            $content = '';
         }
 
-        if ($this->reuseVAPIDHeaders) {
-            $this->vapidHeaders = [];
+        $headers['TTL'] = $options['TTL'];
+
+        if (isset($options['urgency'])) {
+            $headers['Urgency'] = $options['urgency'];
         }
-    }
 
-    /**
-     * @param array $notifications
-     *
-     * @return array
-     *
-     * @throws \ErrorException
-     */
-    private function prepare(array $notifications): array
-    {
-        $requests = [];
-        /** @var Notification $notification */
-        foreach ($notifications as $notification) {
-            $subscription = $notification->getSubscription();
-            $endpoint = $subscription->getEndpoint();
-            $userPublicKey = $subscription->getPublicKey();
-            $userAuthToken = $subscription->getAuthToken();
-            $contentEncoding = $subscription->getContentEncoding();
-            $payload = $notification->getPayload();
-            $options = $notification->getOptions($this->getDefaultOptions());
-            $auth = $notification->getAuth($this->auth);
+        if (isset($options['topic'])) {
+            $headers['Topic'] = $options['topic'];
+        }
 
-            if (!empty($payload) && !empty($userPublicKey) && !empty($userAuthToken)) {
-                if (!$contentEncoding) {
-                    throw new \ErrorException('Subscription should have a content encoding');
-                }
-
-                $encrypted = Encryption::encrypt($payload, $userPublicKey, $userAuthToken, $contentEncoding);
-                $cipherText = $encrypted['cipherText'];
-                $salt = $encrypted['salt'];
-                $localPublicKey = $encrypted['localPublicKey'];
-
-                $headers = [
-                    'Content-Type' => 'application/octet-stream',
-                    'Content-Encoding' => $contentEncoding,
-                ];
-
-                if ($contentEncoding === "aesgcm") {
-                    $headers['Encryption'] = 'salt='.Base64Url::encode($salt);
-                    $headers['Crypto-Key'] = 'dh='.Base64Url::encode($localPublicKey);
-                }
-
-                $encryptionContentCodingHeader = Encryption::getContentCodingHeader($salt, $localPublicKey, $contentEncoding);
-                $content = $encryptionContentCodingHeader.$cipherText;
-
-                $headers['Content-Length'] = Utils::safeStrlen($content);
+        // if GCM
+        if (substr($endpoint, 0, strlen(self::GCM_URL)) === self::GCM_URL) {
+            if (array_key_exists('GCM', $auth)) {
+                $headers['Authorization'] = 'key='.$auth['GCM'];
             } else {
-                $headers = [
-                    'Content-Length' => 0,
-                ];
-
-                $content = '';
+                throw new \ErrorException('No GCM API Key specified.');
+            }
+        }
+        // if VAPID (GCM doesn't support it but FCM does)
+        elseif (array_key_exists('VAPID', $auth) && $contentEncoding) {
+            $audience = parse_url($endpoint, PHP_URL_SCHEME).'://'.parse_url($endpoint, PHP_URL_HOST);
+            if (!parse_url($audience)) {
+                throw new \ErrorException('Audience "'.$audience.'"" could not be generated.');
             }
 
-            $headers['TTL'] = $options['TTL'];
+            $vapidHeaders = $this->getVAPIDHeaders($audience, $contentEncoding, $auth['VAPID']);
 
-            if (isset($options['urgency'])) {
-                $headers['Urgency'] = $options['urgency'];
-            }
+            $headers['Authorization'] = $vapidHeaders['Authorization'];
 
-            if (isset($options['topic'])) {
-                $headers['Topic'] = $options['topic'];
-            }
-
-            // if GCM
-            if (substr($endpoint, 0, strlen(self::GCM_URL)) === self::GCM_URL) {
-                if (array_key_exists('GCM', $auth)) {
-                    $headers['Authorization'] = 'key='.$auth['GCM'];
+            if ($contentEncoding === 'aesgcm') {
+                if (array_key_exists('Crypto-Key', $headers)) {
+                    $headers['Crypto-Key'] .= ';'.$vapidHeaders['Crypto-Key'];
                 } else {
-                    throw new \ErrorException('No GCM API Key specified.');
+                    $headers['Crypto-Key'] = $vapidHeaders['Crypto-Key'];
                 }
             }
-            // if VAPID (GCM doesn't support it but FCM does)
-            elseif (array_key_exists('VAPID', $auth) && $contentEncoding) {
-                $audience = parse_url($endpoint, PHP_URL_SCHEME).'://'.parse_url($endpoint, PHP_URL_HOST);
-                if (!parse_url($audience)) {
-                    throw new \ErrorException('Audience "'.$audience.'"" could not be generated.');
-                }
-
-                $vapidHeaders = $this->getVAPIDHeaders($audience, $contentEncoding, $auth['VAPID']);
-
-                $headers['Authorization'] = $vapidHeaders['Authorization'];
-
-                if ($contentEncoding === 'aesgcm') {
-                    if (array_key_exists('Crypto-Key', $headers)) {
-                        $headers['Crypto-Key'] .= ';'.$vapidHeaders['Crypto-Key'];
-                    } else {
-                        $headers['Crypto-Key'] = $vapidHeaders['Crypto-Key'];
-                    }
-                }
-            }
-
-            $requests[] = new Request($endpoint, $headers, $content);
         }
 
-        return $requests;
+        return new Request($endpoint, $headers, $content);
     }
 
     /**
